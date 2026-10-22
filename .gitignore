@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+artifacts/data/
+artifacts/*.log
+work/
+dist/
+*.docx
+*.pdf
+*.vsdx
+*.pptx
+.DS_Store
