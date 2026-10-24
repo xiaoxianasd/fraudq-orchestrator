@@ -22,6 +22,8 @@ from .s3 import Fusion, FusionAgent, HAN, Platt, S3HanAgent
 
 RELEASE, ESCALATE, FULL = "release", "escalate", "full"
 
+PEER_HORIZON = 3 * DAY     # 对端记忆的固定回放窗口
+
 
 class Screener(nn.Module):
     """44→16→(:均值, :对数方差)，恰 754 个参数。"""
@@ -65,7 +67,7 @@ class Engine:
 
     def note_cost(self, name: str, ms: float) -> None:
         old = self.cost_hint(name)
-        ms = min(ms, max(old * 4.0, 5.0))     # 抑制预热类尖峰污染估计
+        ms = min(ms, max(old * 6.0, 50.0), 150.0)   # 抑制预热尖峰；绝对上限 150ms
         self._cost[name] = 0.7 * old + 0.3 * ms
 
     def invalidate(self, from_ts: int) -> None:
@@ -86,13 +88,9 @@ class Engine:
         W = self._np_weights()
         te0 = np.zeros(16, np.float32); te0[1::2] = 1.0        # TE(0) = [0,1,0,1,...]
         zero = np.zeros(128, np.float32)
-        # 增量续算：若存在更早且足够近的快照，只处理两者之间新增的记录
-        base = max((k for k in self._peer if k < t), default=None)
-        if base is not None and t - base <= 12 * 3600_000:
-            mem = {u: v.numpy().copy() for u, v in self._peer[base].items()}
-            lo = base
-        else:
-            mem, lo = {}, t - 3 * DAY
+        # 固定回放窗口：同一截点的记忆只由 [t-H, t] 的记录决定，与"之前算过哪些截点"无关。
+        # 不做增量续算——否则结果会依赖缓存历史，破坏"同一截点可复现"。
+        mem, lo = {}, t - PEER_HORIZON
         calls = [c for c in self.store.calls if lo <= c.avail <= t]
         calls.sort(key=lambda c: (c.avail, c.start))
         for c in calls:
@@ -134,11 +132,11 @@ class Engine:
             return self.m["platt_" + kind](logit)
 
     # ---------- 样本 ----------
-    def prepare(self, q: Query) -> Sample:
-        x, m, _ = self.store.profile(q.user, q.cutoff)
-        a = self.store.visible(q.user, q.cutoff)
+    def prepare(self, q: Query, skip: frozenset = frozenset()) -> Sample:
+        x, m, _ = self.store.profile(q.user, q.cutoff, skip)
+        a = self.store.visible(q.user, q.cutoff, skip)
         if len(a):
-            idx = int(np.flatnonzero(self.store.vis_mask(q.user, q.cutoff))[-1])
+            idx = int(np.flatnonzero(self.store.vis_mask(q.user, q.cutoff, skip))[-1])
             last = self.store.event_vector(self.store.EC[q.user][idx], q.user, q.cutoff)
         else:
             last = np.zeros(12)
@@ -146,22 +144,33 @@ class Engine:
 
     # ---------- 隔离重放：带屏蔽重算 ----------
     def rescore(self, ctx: Context, skip_calls: frozenset, skip_keys: dict) -> float:
-        sub = Context(ctx.q, self.store, ctx.sample, Budget(1e9), Trace(ctx.q.qid, ctx.q.user,
-                      ctx.q.cutoff), self)
+        """屏蔽证据后按原路径重算，返回综合风险分数的概率值。
+
+        与首评的差别只有三点：画像/记忆/统计按 skip 重建；只重跑首评实际执行过的分支
+        （不把"HAN 原本没跑"变成"跑了"）；其余参数与版本一律固定。
+        """
+        sub = Context(ctx.q, self.store, self.prepare(ctx.q, frozenset(skip_calls)),
+                      Budget(1e9), Trace(ctx.q.qid, ctx.q.user, ctx.q.cutoff), self)
         sub.skip_calls = frozenset(skip_calls)
         sub.skip_keys = skip_keys
+        relq = ctx.get("RELQ")
+        if relq:
+            sub.put("RELQ", **relq)
+        ran = set(ctx.trace.results.keys())
         with torch.no_grad():
             for ag in self.branches:
-                if ag.eligible(sub):
+                if ag.name in ran and ag.eligible(sub):
                     ag.run(sub)
-        return sub.get("FUSE").get("logit", 0.0)
+        logit = float(sub.get("FUSE").get("logit", 0.0))
+        return float(1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, logit)))))
 
 
 class Coordinator:
     def __init__(self, engine: Engine):
         self.engine = engine
         self.s1 = S1Agent(engine.m["tgn"])
-        self.s2 = S2Agent(engine.m["s2_norm"], engine.m["s2_abn"], engine.m["s2_med"], engine.m["s2_iqr"])
+        self.s2 = S2Agent(engine.m["s2_norm"], engine.m["s2_abn"], engine.m["s2_med"],
+                          engine.m["s2_iqr"], bank_ok=bool(engine.m.get("s2_ok", True)))
         self.han = S3HanAgent(engine.m["han"])
         self.fuse = FusionAgent(engine.m["fusion"])
         self.replay = ReplayAgent()
@@ -248,6 +257,9 @@ class Coordinator:
         # ---- 4 按需关系核查 ----
         trig, why = self.relation_trigger(ctx)
         quals, cands, avail = self.han.available(ctx)
+        # 数据质量与路径可用标记属于数据本身，与 HAN 是否执行无关：
+        # 单独落一份给融合层，避免 HAN 未触发时被当作"质量=0/路径全不可用"
+        ctx.put("RELQ", quals=quals, avail=avail)
         if trig and any(avail.values()):
             tr.log("TRIGGER", why + f" & Σm_φ={sum(avail.values())}", "插入 HAN", 0.0, "关系侧条件成立")
             ctx.emit("trigger", "关系侧条件成立，插入 HAN", reason=why,
@@ -259,8 +271,8 @@ class Coordinator:
             ctx.emit("trigger", "跳过关系核查", reason=why or "未满足触发条件",
                      avail=[k for k in REL_KINDS if avail[k]])
 
-        # ---- 5 融合 ----
-        self._run(ctx, self.fuse)
+        # ---- 5 融合（唯一不可降级的分支：融合缺失会把"有证据"变成"零风险"）----
+        self._run(ctx, self.fuse, force=True)
         f = ctx.get("FUSE", {})
         p = f.get("p", 0.0)
         gap = ReplayAgent.gap(ctx)
@@ -312,18 +324,27 @@ class Coordinator:
             u = 1.0
         return p0, u, (u <= .25)
 
-    def _run(self, ctx, agent) -> None:
+    def _run(self, ctx, agent, force: bool = False) -> None:
         eng = self.engine
         est = agent.estimate(ctx)
         if not agent.eligible(ctx):
             ctx.trace.log(agent.name, "eligible=false", "跳过", 0.0, "条件不满足")
             ctx.emit("skip", "跳过", agent=agent.name, reason="执行条件不满足")
+            if hasattr(agent, "skip"):
+                agent.skip(ctx, "执行条件不满足")
+            else:
+                ctx.put(agent.name, skipped=True, reason="执行条件不满足")
             return
-        if not ctx.budget.afford(est):
+        if not force and not ctx.budget.afford(est):
             ctx.trace.log(agent.name, f"预算剩余={ctx.budget.left:.1f}ms < {est:.1f}ms",
                           "降级跳过", 0.0, "以掩码位进入融合，不按零风险处理")
             ctx.emit("skip", "预算不足，降级跳过", agent=agent.name,
                      reason=f"剩余 {ctx.budget.left:.1f}ms < 预估 {est:.1f}ms")
+            if hasattr(agent, "skip"):
+                agent.skip(ctx, "剩余时延预算不足")
+            else:
+                ctx.put(agent.name, skipped=True, reason="剩余时延预算不足")
+            ctx.trace.results[agent.name]["budget"] = True
             return
         ctx.reset_clock()
         with torch.no_grad():
@@ -335,7 +356,8 @@ class Coordinator:
 
     @staticmethod
     def _verdict(p: float) -> str:
-        return "疑似诈骗" if p >= .50 else ("需观察" if p >= .20 else "安全")
+        """分支分数的展示口径，与表6 一致（0.80 / 0.20）。"""
+        return "高危" if p >= .80 else ("可疑" if p >= .20 else "低危")
 
     def _narrate(self, ctx, agent, ms: float) -> None:
         n = agent.name
@@ -352,7 +374,8 @@ class Coordinator:
                      B_s=round(d.get("B_s", 0), 3), B_l=round(d.get("B_l", 0), 3),
                      C_temp=round(d.get("C_temp", 0), 3), lam=d.get("lam", 0),
                      E_ts=round(d.get("E_ts", 0), 4),
-                     ws=round(d.get("W_s", 0) / 60000), wl=round(d.get("W_l", 0) / 86400000),
+                     ws=(None if d.get("flag") == "未执行" else round(d.get("W_s", 0) / 60000)),
+                      wl=(None if d.get("flag") == "未执行" else round(d.get("W_l", 0) / 86400000)),
                      ms=round(ms, 1), next="转关系核查")
         elif n == "HAN":
             d = ctx.get("HAN", {})
@@ -411,12 +434,15 @@ class Judge:
     @staticmethod
     def decide(ctx) -> tuple[str, str]:
         q = ctx.q
-        if not q.identity or q.q_call < .98:
+        if not q.identity or q.q_call < .90:
             return "信息不足", "无"
         if not ctx.has("FUSE"):
             return "可疑", "观察"           # 预算耗尽：保守落地到观察，不阻断也不放行
+        # 表6 第7行：任一分支因预算降级 → 不拿残缺向量下结论，保守落地到观察
+        if any(ctx.get(k, {}).get("budget") for k in ("S1", "S2", "HAN")):
+            return "可疑", "观察"
         f = ctx.get("FUSE", {})
-        p, lo = f.get("p", 0.0), f.get("p_lo", 0.0)
+        p, lo, hi = f.get("p", 0.0), f.get("p_lo", 0.0), f.get("p_hi", 1.0)
         capp = ctx.get("DQ", {}).get("level") == "degraded"   # 数据降质：禁止阻断
         if p >= .80:
             if lo >= .80 and not capp:
@@ -424,7 +450,10 @@ class Judge:
             return "高危(敏感)", "预警"
         if ctx.get("FAST", {}).get("hit"):
             return "快通道告警", "预警"
-        return ("可疑", "观察") if p >= .20 else ("低危", "放行")
+        # 表6 第5行：中风险、可观测历史不足 7 天、或敏感性上界越过高分阈值 → 可疑/观察
+        if p >= .20 or ctx.sample.history_days < 7.0 or hi >= .80:
+            return "可疑", "观察"
+        return "低危", "放行"
 
 
 def _np_step(sp: np.ndarray, te: np.ndarray, e: np.ndarray, W: dict) -> np.ndarray:

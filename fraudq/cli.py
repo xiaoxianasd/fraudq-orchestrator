@@ -115,7 +115,10 @@ class App:
         elif stage == "S2":
             body.append(f"B_s={kw.get('B_s')} B_l={kw.get('B_l')} C_temp={kw.get('C_temp')} "
                         f"λ={kw.get('lam')} E_ts={kw.get('E_ts')}")
-            body.append(c(f"窗口 W_s={kw.get('ws')}min W_l={kw.get('wl')}d   {kw.get('ms')}ms", "d"))
+            if kw.get("ws") is None:
+                body.append(c(f"未执行（可观测历史不足或预算不足）   {kw.get('ms')}ms", "d"))
+            else:
+                body.append(c(f"窗口 W_s={kw.get('ws')}min W_l={kw.get('wl')}d   {kw.get('ms')}ms", "d"))
         elif stage == "HAN":
             pt = " ".join(f"{k}:{v}" for k, v in (kw.get("paths") or {}).items())
             body.append(f"p_H={kw.get('p_H', '')}  路径权重 {pt or '—'}")
@@ -157,8 +160,11 @@ class App:
         if s2:
             print(c("│", "d") + f" S2      B_s={s2['B_s']:.2f}  B_l={s2['B_l']:.2f}  "
                   f"C_temp={s2['C_temp']:.2f}  λ={s2['lam']}  E_ts={s2['E_ts']:.3f}  [{s2['flag']}]")
-            print(c("│", "d") + c(f"         窗口 W_s={s2['W_s']/60000:.0f}min W_l={s2['W_l']/86400000:.0f}d  "
-                  f"K={s2['K']} D={s2['D']}  复现度R={s2['R']:.2f}", "d"))
+            if s2.get("flag") == "未执行":
+                print(c("│", "d") + c(f"         未执行：{s2.get('reason', '')}", "d"))
+            else:
+                print(c("│", "d") + c(f"         窗口 W_s={s2['W_s']/60000:.0f}min W_l={s2['W_l']/86400000:.0f}d  "
+                      f"K={s2['K']} D={s2['D']}  复现度R={s2['R']:.2f}", "d"))
         if han:
             beta = han.get("beta") or [0] * 5
             bs = "  ".join(f"{k}:{b:.2f}" for k, b in zip(REL_KINDS, beta) if b > 1e-3)
@@ -455,7 +461,7 @@ def ensure_assets(data_dir: str, model: str, auto: bool = True):
         if not auto:
             raise SystemExit("缺少模型，先运行 python -m fraudq --train")
         print(c("  未找到模型，开始训练（约 2-3 分钟）…", "y"))
-        fit(ds, epochs=3, out=model)
+        fit(ds, epochs=8, out=model)
     eng, coord = load(model, ds)
     return ds, eng, coord
 
@@ -476,7 +482,7 @@ def main(argv=None) -> None:
         if not os.path.exists(os.path.join(a.data, "calls.csv")):
             generate(seed=7).save(a.data)
         ds = Dataset.load(a.data)
-        fit(ds, epochs=3, out=a.model)
+        fit(ds, epochs=8, out=a.model)
         return
 
     ds, eng, coord = ensure_assets(a.data, a.model)

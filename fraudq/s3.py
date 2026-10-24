@@ -79,15 +79,27 @@ class S3HanAgent:
         self.max_nodes = max_nodes
 
     def estimate(self, ctx) -> float:
-        return 8.0 + 0.3 * ctx.engine.cost_hint("HAN")
+        return 1.2 * max(ctx.engine.cost_hint("HAN"), 5.0)
 
     def eligible(self, ctx) -> bool:
         return True
 
     def quality(self, ctx) -> Dict[str, float]:
-        q = ctx.q
-        base = float(min(1.0, max(0.0, q.q_d)))
-        return {"D": base, "C": float(q.q_call), "I": base * .97, "B": min(1.0, base * 1.05), "P": base * .93}
+        """四类关系质量 = 窗口内有效且可匹配记录数 / 该用户窗口内可用通话数。
+
+        与说明书 3.2、表4 一致；分母不足 5 条时质量记为未知（0），该路径不可用。
+        共同目标路径质量直接取话单完整性。
+        """
+        st, q = ctx.store, ctx.q
+        calls = st.visible(q.user, q.cutoff)
+        out = {"C": float(q.q_call)}
+        for k in ("D", "I", "B", "P"):
+            win = REL_WINDOW[k]
+            n_call = int((calls[:, 1] >= q.cutoff - win).sum()) if len(calls) else 0
+            n_obs = sum(1 for _key, at, av in st.RU[k].get(q.user, ())
+                        if av <= q.cutoff and at >= q.cutoff - win)
+            out[k] = min(1.0, n_obs / n_call) if n_call >= 5 else 0.0
+        return out
 
     def candidates(self, ctx) -> Dict[str, Dict[int, float]]:
         out = {}
@@ -134,6 +146,9 @@ class S3HanAgent:
                       f"p^_H={p_cal:.3f} 可用路径={[k for k in REL_KINDS if avail[k]]}")
 
 
+SENS_LO, SENS_HI = 0.02, 0.98     # 敏感性区间把关系分支推到的两个极端值
+
+
 class FusionAgent:
     name = "FUSE"
 
@@ -150,8 +165,10 @@ class FusionAgent:
         s1 = ctx.get("S1")
         s2 = ctx.get("S2")
         han = ctx.get("HAN")
-        quals = han.get("quals") or {k: 0.0 for k in REL_KINDS}
-        av = han.get("avail") or {k: False for k in REL_KINDS}
+        # 优先读调度器落的 RELQ（与 HAN 是否执行无关），无则退回 HAN 结果
+        rel = ctx.get("RELQ") or han
+        quals = rel.get("quals") or {k: 0.0 for k in REL_KINDS}
+        av = rel.get("avail") or {k: False for k in REL_KINDS}
         v = np.zeros(15)
         v[0] = self._logit(s1.get("p_cal", 0.5))
         v[1] = self._logit(han.get("p_cal", 0.5)) if han else 0.0
@@ -166,18 +183,20 @@ class FusionAgent:
         for i, k in enumerate(REL_KINDS):
             v[10 + i] = 1.0 if av.get(k) else 0.0
         logit = self.fusion(torch.tensor(v, dtype=torch.float32))
-        p = float(torch.sigmoid(logit))
+        # 判决分数统一用校准后的 p（训练目标就是 platt_F(σ(z))，两者必须同一把尺子）
+        p_cal = float(ctx.engine.platt("F", logit.unsqueeze(0)))
         # 敏感性区间：把关系分支推到两个极端，看综合分会落到哪（<1ms，无需重跑分支）
-        lo = v.copy(); lo[1] = self._logit(1e-3)
-        hi = v.copy(); hi[1] = self._logit(1 - 1e-3)
+        lo = v.copy(); lo[1] = self._logit(SENS_LO)
+        hi = v.copy(); hi[1] = self._logit(SENS_HI)
         with torch.no_grad():
             f = self.fusion
-            p_lo = float(torch.sigmoid(f(torch.tensor(lo, dtype=torch.float32))))
-            p_hi = float(torch.sigmoid(f(torch.tensor(hi, dtype=torch.float32))))
-        ctx.put("FUSE", p=p, v=v, logit=float(logit),
-                p_lo=min(p_lo, p_hi), p_hi=max(p_lo, p_hi),
-                p_cal=ctx.engine.platt("F", logit.unsqueeze(0)).item())
-        ctx.trace.log("FUSE", "always", "run", ctx.elapsed(), f"p={p:.3f}")
+            lo_l = f(torch.tensor(lo, dtype=torch.float32))
+            hi_l = f(torch.tensor(hi, dtype=torch.float32))
+            p_lo = float(ctx.engine.platt("F", lo_l))
+            p_hi = float(ctx.engine.platt("F", hi_l))
+        ctx.put("FUSE", p=p_cal, p_raw=float(torch.sigmoid(logit)), v=v, logit=float(logit),
+                p_lo=min(p_lo, p_hi), p_hi=max(p_lo, p_hi), p_cal=p_cal)
+        ctx.trace.log("FUSE", "always", "run", ctx.elapsed(), f"p={p_cal:.3f}")
 
     @staticmethod
     def _logit(p: float) -> float:

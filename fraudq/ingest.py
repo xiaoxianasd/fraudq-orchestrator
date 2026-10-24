@@ -32,6 +32,7 @@ ALIAS = {"caller": ("caller", "主叫", "caller_no", "from"),
          "user": ("user", "用户", "phone_no_m"),
          "kind": ("kind", "类型"),
          "key": ("key", "标识", "device", "ip", "bs", "pay"),
+         "etype": ("etype", "实体类型", "pay_type"),
          "obs_at": ("observed_at", "obs_at", "观测时间")}
 
 
@@ -105,7 +106,10 @@ def _norm_obs(row: Dict[str, Any], seq: int):
     avail = _pick(row, "avail")
     avail = int(float(avail)) if avail is not None else at + 1000
     oid = str(_pick(row, "cid") or f"oing-{seq:08d}")
-    return Obs(oid, u, kind, str(key), at, avail), None
+    et = str(_pick(row, "etype", "account") or "account").strip().lower()
+    if kind == "P" and et not in ("account", "merchant", "terminal"):
+        return None, f"支付实体类型不可核验：{et}（仅 account/merchant/terminal）"
+    return Obs(oid, u, kind, str(key), at, avail, True, et), None
 
 
 def ingest_rows(store: Store, engine, rows: Iterable[Dict[str, Any]],

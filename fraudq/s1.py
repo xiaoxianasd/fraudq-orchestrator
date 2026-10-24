@@ -75,10 +75,14 @@ class S1Agent:
         self.window = window
 
     def estimate(self, ctx) -> float:
-        return 6.0 + 0.25 * ctx.engine.cost_hint("S1")
+        return 1.2 * max(ctx.engine.cost_hint("S1"), 6.0)
 
     def eligible(self, ctx) -> bool:
         return ctx.sample.n_ev > 0
+
+    def skip(self, ctx, reason: str) -> None:
+        ctx.put("S1", skipped=True, reason=reason, p=0.5, p_cal=0.5, c_sem=0.0,
+                n_ev=0, top=[], checkpoints=0, cps=[])
 
     def stream(self, ctx) -> tuple[List[torch.Tensor], List[int]]:
         """目标用户本地流（对端记忆冻结）：逐事件记忆快照 + 检查点下标。"""
@@ -124,6 +128,7 @@ class S1Agent:
             h_nb, e_nb, dt_nb = torch.zeros(0, 64), torch.zeros(0, 12), torch.zeros(0, 16)
             valid = torch.zeros(0, dtype=torch.bool)
         ctx._n_snap = len(snaps)
+        ctx._cps = cps
         return m.score(s_u, x, h_nb, e_nb, dt_nb, valid)
 
     def run(self, ctx) -> None:
@@ -132,8 +137,9 @@ class S1Agent:
         p_cal = float(ctx.engine.platt("T", logit.unsqueeze(0)))
         n = getattr(ctx, "_n_snap", 0)
         c_sem = 0.5 * float(ctx.sample.m.sum() / 16.0) + 0.5 * min(1.0, n / 20.0)
+        cps = getattr(ctx, "_cps", [])
         ctx.put("S1", p=p, p_cal=p_cal, c_sem=c_sem, n_ev=n, top=self._top(ctx), checkpoints=n,
-                logit=float(logit))
+                cps=list(cps[-20:]), logit=float(logit))
         ctx.trace.log("S1", "n_ev>0", "run", ctx.elapsed(),
                       f"p_T={p:.3f} p^_T={p_cal:.3f} C_sem={c_sem:.2f} 检查点={n}")
 

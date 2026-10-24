@@ -62,23 +62,23 @@ def fit(ds, epochs=5, out="artifacts/model.pt", verbose=True) -> dict:
     else:
         tr_fit = tr
     cutoffs = sorted({q.cutoff for q in ds.queries})
-    t1 = time.time()
-    for c in cutoffs:
-        eng.peer_memory(c)
     if verbose:
-        print(f"  [peers] {len(cutoffs)} 截点 × {len(store.calls)} 通话  {time.time()-t1:.1f}s")
+        print(f"  [peers] {len(cutoffs)} 截点，按当前 TGN 权重惰性回放（不再预先生成随机权重快照）")
 
     # ---- S2 双模式库 ----
     s2 = S2Agent()
-    feats, labs = [], []
+    feats, labs, bs_, bl_ = [], [], [], []
     for q in tr:
         c = ctx_of(eng, q); s2.run(c)
-        feats.append(c.get("S2")["pat"]); labs.append(q.label)
-    s2.fit(np.array(feats), np.array(labs))
+        d = c.get("S2")
+        feats.append(d["pat"]); labs.append(q.label)
+        bs_.append(d["B_s"]); bl_.append(d["B_l"])
+    s2.fit(np.array(feats), np.array(labs), np.array(bs_), np.array(bl_))
     m.update({"s2_norm": torch.tensor(s2.norm, dtype=torch.float32),
               "s2_abn": torch.tensor(s2.abn, dtype=torch.float32),
               "s2_med": torch.tensor(s2.med, dtype=torch.float32),
-              "s2_iqr": torch.tensor(s2.iqr, dtype=torch.float32)})
+              "s2_iqr": torch.tensor(s2.iqr, dtype=torch.float32),
+              "s2_ok": bool(s2.bank_ok)})
     if verbose:
         print(f"  [S2] 正常库 {len(s2.norm)} 质心 | 异常库 {len(s2.abn)} 质心（爆发/渐进分层）")
 
@@ -100,6 +100,7 @@ def fit(ds, epochs=5, out="artifacts/model.pt", verbose=True) -> dict:
     opt = torch.optim.Adam(m["tgn"].parameters(), lr=2e-3)
     yy = torch.tensor([float(q.label) for q in tr_fit])
     for ep in range(epochs):
+        eng._peer.clear()          # 每轮用当前权重重放对端记忆，避免训练/推理不一致
         perm = np.random.default_rng(ep).permutation(len(tr_fit))
         tot, n = 0.0, 0
         for i in perm:
@@ -129,6 +130,7 @@ def fit(ds, epochs=5, out="artifacts/model.pt", verbose=True) -> dict:
             print(f"  [HAN] epoch {ep+1}/{epochs}  bce={tot/n:.4f} (可用 {n} 条)")
 
     # ---- 分支 Platt 校准 ----
+    eng._peer.clear()              # 用收敛后的权重重放一次
     for key, pl in (("T", m["platt_T"]), ("H", m["platt_H"])):
         xs, ys2 = [], []
         for q, i in sub:
@@ -187,9 +189,11 @@ def fit(ds, epochs=5, out="artifacts/model.pt", verbose=True) -> dict:
 
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     torch.save({"models": {k: (v.state_dict() if isinstance(v, nn.Module) else v) for k, v in m.items()},
-                "stats": stats, "banks": {"norm": m["s2_norm"], "abn": m["s2_abn"],
-                                          "med": m["s2_med"], "iqr": m["s2_iqr"]},
                 "peers": {c: {u: v for u, v in d.items()} for c, d in eng._peer.items()},
+                "stats": stats, "banks": {"norm": m["s2_norm"], "abn": m["s2_abn"],
+                                          "med": m["s2_med"], "iqr": m["s2_iqr"],
+                                          "ok": m.get("s2_ok", True)},
+
                 "version": "v1"}, out)
     if verbose:
         print(f"  [SAVE] {out}  {os.path.getsize(out)/1e6:.1f} MB  {time.time()-t0:.0f}s")

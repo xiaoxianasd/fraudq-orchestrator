@@ -19,6 +19,7 @@ import numpy as np
 from .core import BUSY, CONNECT, DAY, FAILED, HOUR, MIN, Obs, Call, Query, UNANSWERED
 
 VICTIM_BASE = 900000
+COVER_P = .88          # 每条通话为两端各生成四类关联观测的概率（保证窗口覆盖率 >0.80）
 OUT_POOL = [200000 + i for i in range(1200)]   # 有限外部号码池，避免节点数爆炸
 
 
@@ -54,9 +55,9 @@ class Dataset:
                             int(c.dur_valid), int(c.caller_ok), int(c.callee_ok), c.batch])
         with open(os.path.join(out, "obs.csv"), "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["obs_id", "user", "kind", "key", "observed_at", "available_at", "valid"])
+            w.writerow(["obs_id", "user", "kind", "key", "observed_at", "available_at", "valid", "etype"])
             for o in self.obs:
-                w.writerow([o.oid, o.user, o.kind, o.key, o.at, o.avail, int(o.valid)])
+                w.writerow([o.oid, o.user, o.kind, o.key, o.at, o.avail, int(o.valid), o.etype])
         with open(os.path.join(out, "queries.csv"), "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["query_id", "user", "cutoff", "label", "q_call", "q_d", "identity_known"])
@@ -78,7 +79,8 @@ class Dataset:
                       r["caller_ok"] in ("1", "True"), r["callee_ok"] in ("1", "True"),
                       int(r.get("batch", 0) or 0)) for r in rows("calls.csv")]
         obs = [Obs(r["obs_id"], int(r["user"]), r["kind"], r["key"], int(r["observed_at"]),
-                   int(r["available_at"]), r["valid"] in ("1", "True")) for r in rows("obs.csv")]
+                   int(r["available_at"]), r["valid"] in ("1", "True"),
+                   (r.get("etype") or "account")) for r in rows("obs.csv")]
         qs = [Query(r["query_id"], int(r["user"]), int(r["cutoff"]), int(r["label"]),
                     float(r["q_call"]), float(r["q_d"]), r["identity_known"] in ("1", "True"))
               for r in rows("queries.csv")]
@@ -209,9 +211,12 @@ def generate(seed: int = 7, days: int = 30, n_normal: int = 180,
     obs: List[Obs] = []
     oid = 0
 
-    def add_obs(u: int, kind: str, key: str, t: int, delay: int = 5000) -> None:
+    def add_obs(u: int, kind: str, key: str, t: int, delay: int = 5000,
+                etype: str = None) -> None:
         nonlocal oid
-        obs.append(Obs(f"o{oid:07d}", u, kind, key, t, t + delay))
+        if etype is None and kind == "P":      # 支付实体必须是可核验的账户/收款实体/支付终端
+            etype = ("account", "merchant", "terminal")[oid % 3]
+        obs.append(Obs(f"o{oid:07d}", u, kind, key, t, t + delay, True, etype or "account"))
         oid += 1
 
     def keys_for(u: int) -> Dict[str, str]:
@@ -247,6 +252,22 @@ def generate(seed: int = 7, days: int = 30, n_normal: int = 180,
                 add_obs(u, "B", f"bs-u{u}-hop{i}", t, 2000)
                 add_obs(u, "I", f"ip-u{u}-hot{i}", t, 2000)
             add_obs(u, "P", f"pay-u{u}-new", onset[u] + 5 * MIN, 2000)
+
+    # ---- 通话级覆盖观测：让每类关联在同一窗口内覆盖该用户的通话（口径见 s3.quality）----
+    # 用独立随机源，避免改变主 rng 序列（保证 calls / queries 与旧数据集逐字节一致）
+    rng2 = random.Random(seed * 1000003 + 11)
+    for c in calls:
+        for u in (c.caller, c.callee):
+            if u not in users:          # 外部号码不在用户表内，跳过
+                continue
+            base = keys_for(u)
+            for kd in ("D", "I", "B", "P"):
+                if rng2.random() >= COVER_P:
+                    continue
+                key = base[kd]
+                if users[u] == "burst" and c.start >= onset.get(u, T):
+                    key = f"{base[kd]}-hot{(c.start // (8 * MIN)) % 3}"
+                add_obs(u, kd, key, c.start, rng2.randint(300, 2500))
 
     # ---- 查询截点 ----
     queries: List[Query] = []

@@ -16,7 +16,9 @@ STATUS_NAME = ("接通", "未接", "忙线", "其他失败")
 
 REL_KINDS = ("D", "C", "I", "B", "P")
 REL_NAME = {"D": "共享设备", "C": "共同目标", "I": "网络地址", "B": "基站位置", "P": "支付实体"}
-REL_WINDOW = {"D": 7 * DAY, "C": DAY, "I": DAY, "B": HOUR, "P": 30 * DAY}
+# B（基站位置）改用 24 小时窗口：1 小时窗口内通话中位数为 0，"分母≥5"的质量门槛
+# 会导致该路径在 618 个截点里只有 2 条可用，等于五条路径缺一条。
+REL_WINDOW = {"D": 7 * DAY, "C": DAY, "I": DAY, "B": DAY, "P": 30 * DAY}
 REL_GATE = {"D": .80, "C": .98, "I": .80, "B": .80, "P": .80}
 
 STAT_NAMES = (
@@ -54,6 +56,7 @@ class Obs:
     at: int
     avail: int
     valid: bool = True
+    etype: str = "account"      # 仅支付实体使用：account / merchant / terminal
 
 
 @dataclass(slots=True)
