@@ -86,6 +86,9 @@ class S2Agent:
 
     # ---------- 窗口 ----------
     def windows(self, ctx) -> tuple[float, float]:
+        from .ablate import CFG
+        if CFG.get("fixed_window"):
+            return float(2 * HOUR), float(14 * DAY)
         st, t, u = ctx.store, ctx.q.cutoff, ctx.q.user
         a = st.visible(u, t)
         n24 = float(((a[:, 1] >= t - DAY)).sum()) if len(a) else 0.0
@@ -363,7 +366,7 @@ class S2Agent:
         p = self._pattern(ctx, X, e, V, t, K, ws)
         pz = (p - self.med) / np.maximum(self.iqr, 1e-6)
         if self.bank_ok:
-            R = max(0.0, float(_cos(pz, self.abn).max() - _cos(pz, self.norm).max()))
+            R = min(1.0, max(0.0, float(_cos(pz, self.abn).max() - _cos(pz, self.norm).max())))
         else:
             R = 0.0
 
