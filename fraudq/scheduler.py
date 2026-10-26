@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from .ablate import CFG
 from .core import (DAY, HOUR, MIN, REL_GATE, REL_KINDS, Budget, Context, Query, Sample,
                    Store, Trace)
 from .replay import ReplayAgent
@@ -237,7 +238,7 @@ class Coordinator:
         self._run(ctx, self.s1)
         s1 = ctx.get("S1", {})
         p_t = s1.get("p", 0.0)
-        if g_u and p0 < .20 and ctx.has("S1") and p_t < .15 and not route_all and not fast:
+        if not CFG.get("all_branches") and g_u and p0 < .20 and ctx.has("S1") and p_t < .15 and not route_all and not fast:
             tr.log("GATE", f"p0={p0:.3f}<0.20 & p_T={p_t:.3f}<0.15 & G_u=1",
                    "级联放行", ctx.elapsed(), "两级都低才放行")
             ctx.emit("gate", "两级判别均为低风险，放行", p0=round(p0, 4), p_t=round(p_t, 4),
@@ -260,7 +261,7 @@ class Coordinator:
         # 数据质量与路径可用标记属于数据本身，与 HAN 是否执行无关：
         # 单独落一份给融合层，避免 HAN 未触发时被当作"质量=0/路径全不可用"
         ctx.put("RELQ", quals=quals, avail=avail)
-        if trig and any(avail.values()):
+        if (trig or CFG.get("all_branches")) and any(avail.values()):
             tr.log("TRIGGER", why + f" & Σm_φ={sum(avail.values())}", "插入 HAN", 0.0, "关系侧条件成立")
             ctx.emit("trigger", "关系侧条件成立，插入 HAN", reason=why,
                      paths=[k for k in REL_KINDS if avail[k]])
@@ -279,7 +280,7 @@ class Coordinator:
         ctx.emit("fuse", "15 维可信度融合", p=round(p, 4), gap=round(gap, 3))
 
         # ---- 6 复核（同步/异步）----
-        if p >= .80 or gap >= .30:
+        if (p >= .80 or gap >= .30) and not CFG.get("no_replay"):
             if replay_mode == "defer":
                 tr.log("TRIGGER", f"p={p:.3f} gap={gap:.3f}", "挂起异步复核", 0.0,
                        "重放只加证据不改分，移出在线路径")

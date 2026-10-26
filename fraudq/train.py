@@ -43,6 +43,7 @@ def auc(y, s) -> float:
 
 def fit(ds, epochs=5, out="artifacts/model.pt", verbose=True) -> dict:
     t0 = time.time()
+    torch.manual_seed(0); np.random.seed(0)   # 固定随机初始化，保证结果可复现
     store = Store(ds.calls, ds.obs)
     users = sorted({c.caller for c in ds.calls if c.caller < 200})
     stats = store.fit_stats(users[:200], max(q.cutoff for q in ds.queries))

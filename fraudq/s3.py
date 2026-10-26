@@ -65,7 +65,7 @@ class Fusion(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.lin = nn.Linear(15, 1)
+        self.lin = nn.Linear(18, 1)
 
     def forward(self, v):
         return self.lin(v).squeeze(-1)
@@ -169,7 +169,7 @@ class FusionAgent:
         rel = ctx.get("RELQ") or han
         quals = rel.get("quals") or {k: 0.0 for k in REL_KINDS}
         av = rel.get("avail") or {k: False for k in REL_KINDS}
-        v = np.zeros(15)
+        v = np.zeros(18)
         v[0] = self._logit(s1.get("p_cal", 0.5))
         v[1] = self._logit(han.get("p_cal", 0.5)) if han else 0.0
         v[2] = s2.get("E_ts", 0.0) if s2 else 0.0
@@ -182,6 +182,9 @@ class FusionAgent:
         v[9] = quals.get("P", 0.0)
         for i, k in enumerate(REL_KINDS):
             v[10 + i] = 1.0 if av.get(k) else 0.0
+        v[15] = 1.0 if s1 else 0.0      # 行为语义分支执行掩码
+        v[16] = 1.0 if s2 else 0.0      # 时序模式核验分支执行掩码
+        v[17] = 1.0 if han else 0.0     # 异构关系核查执行掩码
         logit = self.fusion(torch.tensor(v, dtype=torch.float32))
         # 判决分数统一用校准后的 p（训练目标就是 platt_F(σ(z))，两者必须同一把尺子）
         p_cal = float(ctx.engine.platt("F", logit.unsqueeze(0)))
