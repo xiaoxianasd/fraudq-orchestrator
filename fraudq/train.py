@@ -45,8 +45,9 @@ def fit(ds, epochs=5, out="artifacts/model.pt", verbose=True) -> dict:
     t0 = time.time()
     torch.manual_seed(0); np.random.seed(0)   # 固定随机初始化，保证结果可复现
     store = Store(ds.calls, ds.obs)
-    users = sorted({c.caller for c in ds.calls if c.caller < 200})
-    stats = store.fit_stats(users[:200], max(q.cutoff for q in ds.queries))
+    # 统计量只在本数据域的用户上估计（外部号码不参与），且用户数不再写死为 200
+    users = sorted(ds.archetype) if ds.archetype else sorted({c.caller for c in ds.calls})
+    stats = store.fit_stats(users, max(q.cutoff for q in ds.queries))
 
     m: Dict[str, object] = {"tgn": TGN().float(), "han": HAN().float(), "fusion": Fusion().float(),
                             "screener": Screener().float(), "platt_T": Platt(), "platt_H": Platt(),
@@ -195,7 +196,9 @@ def fit(ds, epochs=5, out="artifacts/model.pt", verbose=True) -> dict:
                                           "med": m["s2_med"], "iqr": m["s2_iqr"],
                                           "ok": m.get("s2_ok", True)},
 
-                "version": "v1"}, out)
+                "version": "v1",
+                "data_sig": {"users": len(ds.archetype), "calls": len(ds.calls),
+                             "queries": len(ds.queries)}}, out)
     if verbose:
         print(f"  [SAVE] {out}  {os.path.getsize(out)/1e6:.1f} MB  {time.time()-t0:.0f}s")
     return {"engine": eng, "models": m, "test": te, "store": store}

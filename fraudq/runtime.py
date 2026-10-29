@@ -32,6 +32,7 @@ def load(path: str, ds: Dataset) -> tuple[Engine, Coordinator]:
     # 新截点则按当前权重现场回放，二者结果相同。
     if blob.get("peers"):
         eng._peer = {int(k): v for k, v in blob["peers"].items()}
+    eng.model_sig = blob.get("data_sig")      # 训练时的数据集签名，供加载方校验
     return eng, Coordinator(eng)
 
 

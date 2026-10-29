@@ -19,8 +19,11 @@ import numpy as np
 from .core import BUSY, CONNECT, DAY, FAILED, HOUR, MIN, Obs, Call, Query, UNANSWERED
 
 VICTIM_BASE = 900000
+CUST_BASE = 700000                             # 合法高频业务（客服/催收/坐席）的存量客户池
+LEAD_BASE = 600000                             # 外呼线索池：只打一次的新名单，占比高但不重复
 COVER_P = .88          # 每条通话为两端各生成四类关联观测的概率（保证窗口覆盖率 >0.80）
 OUT_POOL = [200000 + i for i in range(1200)]   # 有限外部号码池，避免节点数爆炸
+FRAUD_KINDS = ("burst", "slow", "ring")        # 只有这三类是正例；service/family/growth 是难负例
 
 
 @dataclass
@@ -39,7 +42,7 @@ class Dataset:
             "users": len(users), "calls": len(self.calls), "obs": len(self.obs),
             "queries": len(self.queries), "positive": pos,
             "negatives": len(self.queries) - pos,
-            "fraud_users": sum(1 for v in self.archetype.values() if v != "normal"),
+            "fraud_users": sum(1 for v in self.archetype.values() if v in FRAUD_KINDS),
             "kinds": {k: sum(1 for o in self.obs if o.kind == k) for k in ("D", "I", "B", "P")},
         }
 
@@ -104,15 +107,31 @@ def _diurnal(rng: random.Random, day: int) -> int:
 
 
 def generate(seed: int = 7, days: int = 30, n_normal: int = 180,
-             n_burst: int = 10, n_slow: int = 10, n_ring: int = 2, ring_size: int = 3) -> Dataset:
+             n_burst: int = 10, n_slow: int = 10, n_ring: int = 2, ring_size: int = 3,
+             n_service: int = 8, n_family: int = 6, family_size: int = 4,
+             n_growth: int = 8, n_event: int = 10) -> Dataset:
+    """合成 CDR。
+
+    前 6 个参数与旧版一致：把 n_service / n_family / n_growth 置 0 即可逐字节复现旧数据集。
+    后三类是**难负例**（label 恒为 0）：
+      service  客服 / 催收 / 外卖坐席：高频外呼、客户池循环拨打、工作时段集中
+      family   一家人共享同一部手机、家庭网络与小区基站
+      growth   正常业务增长：近 10 天通话量翻数倍（换工作 / 跑销售），目标是熟人池
+      event    良性突发：家长群 / 社区通知 / 红白事，截点前 1 小时打了一圈熟人电话
+    """
     rng = random.Random(seed)
     npr = np.random.default_rng(seed)
     uid = 0
     users: Dict[int, str] = {}
     lam: Dict[int, float] = {}
     onset: Dict[int, int] = {}
+    fam_of: Dict[int, int] = {}
     T = days * DAY
     TEND = (days - 1) * DAY + 21 * HOUR     # 最后一个查询截点：当地 21:00
+    # 前三个沿用旧口径（21:00）；后两个是工作时段（15:00 / 11:00），
+    # 用于让"合法高频外呼"在冲刺时段真正与爆发型同框，否则一律在下班后取样。
+    cuts = [TEND - 7 * DAY, TEND - 2 * DAY, TEND,
+            TEND - DAY - 6 * HOUR, TEND - 7 * DAY - 10 * HOUR]
 
     def new_user(kind: str, rate: float, on: int = T) -> int:
         nonlocal uid
@@ -207,6 +226,125 @@ def generate(seed: int = 7, days: int = 30, n_normal: int = 180,
                     add(u, b, t, int(rng.uniform(20, 90)), CONNECT if rng.random() < .8 else BUSY,
                         True, rng.randint(200, 5000))
 
+    # ================= 难负例（label 恒为 0）=================
+    # 这三类用户行为上"像诈骗"，但都是合法业务/正常生活，用来把合成集从
+    # "剧本可分" 拉到真实运营商场景的难度。
+
+    def _pick(pool, k: int):
+        return [int(x) for x in npr.choice(pool, size=min(k, len(pool)), replace=False)]
+
+    cust_pool = [CUST_BASE + i for i in range(1200)]
+    lead_pool = [LEAD_BASE + i for i in range(40000)]
+
+    # ---- 客服 / 催收 / 外卖坐席：高频外呼，工作时段「冲刺式」批量拨打 ----
+    # 与爆发型的区别：集中在工作日白天、接通率高、时长较长、线索与存量客户混拨。
+    # 与慢热型的区别：没有以天为单位的爬坡。
+    service_users = [new_user("service", 0.0) for _ in range(n_service)]
+    for u in service_users:
+        pool = _pick(cust_pool, rng.randint(220, 360))
+        ptr = rng.randrange(max(1, len(pool)))
+        lptr = (u * 7919) % 5000                    # 每个坐席从线索池的不同位置开始
+        for d in range(days):
+            if (d % 7) >= 5 and rng.random() < .75:      # 周末基本不出勤
+                continue
+            for h0, h1, k, lead_share in ((9.3, 11.6, rng.randint(14, 22), .60),
+                                          (13.8, 16.2, rng.randint(16, 26), .65),
+                                          (18.2, 20.2, rng.randint(8, 14), .40)):
+                if k < 1:
+                    continue
+                spr = h0 + rng.random() * max(0.0, h1 - h0 - 0.3)
+                dense = int(k * .70)
+                for i in range(k):
+                    # 七成通话挤进 10 分钟，与「爆发型」的短时冲刺同形
+                    t = d * DAY + int(((spr + rng.random() * .17) if i < dense
+                                       else (h0 + rng.random() * (h1 - h0))) * HOUR)
+                    if rng.random() < lead_share:       # 新线索：只打一次
+                        b = lead_pool[lptr % len(lead_pool)]
+                        lptr += 1
+                    else:                               # 存量客户：循环回访
+                        b = pool[ptr % len(pool)]
+                        ptr += 1
+                    # 预测式外呼：约两成是拨通即挂的超短呼叫，接通率也偏低
+                    talk = int(rng.uniform(3, 9)) if rng.random() < .22 else int(rng.uniform(15, 115))
+                    add(u, b, t, talk, CONNECT if rng.random() < .62 else UNANSWERED,
+                        True, rng.randint(200, 4000))
+
+    # ---- 夜间班次坐席：部分催收/贷款中介在 21:00–23:30 外呼（夜间主叫比例升高）----
+    for u in service_users[:max(1, n_service // 4)]:
+        pool = _pick(cust_pool, rng.randint(150, 260))
+        ptr, lptr2 = 0, (u * 104729) % 20000
+        for d in range(days):
+            if rng.random() < .45:                       # 不是每晚都有班
+                continue
+            for _ in range(rng.randint(6, 14)):
+                b = (lead_pool[lptr2 % len(lead_pool)] if rng.random() < .55
+                     else pool[ptr % len(pool)])
+                ptr += 1; lptr2 += 1
+                t = d * DAY + int(rng.uniform(21.0, 23.4) * HOUR)
+                talk = int(rng.uniform(3, 10)) if rng.random() < .3 else int(rng.uniform(12, 90))
+                add(u, b, t, talk, CONNECT if rng.random() < .55 else UNANSWERED,
+                    True, rng.randint(200, 4000))
+
+    # ---- 一家人共享设备：4 名成员共用同一部手机 / 家庭网络 / 小区基站 ----
+    # 对五元路径是硬负例：设备、网络、基站三条路径都会把家人连成"团伙"，但他们是正常用户。
+    for fam_id in range(n_family):
+        fam = [new_user("family", 0.0) for _ in range(family_size)]
+        circle = _pick(OUT_POOL, rng.randint(12, 25))     # 一家人共用的亲友圈
+        for m in fam:
+            fam_of[m] = fam_id
+        for d in range(days):
+            for a in fam:
+                for b in fam:
+                    if a == b or rng.random() > .50:
+                        continue
+                    t = d * DAY + int(min(23.9, max(0.0, rng.gauss(19.8, 2.6))) * HOUR)
+                    add(a, b, t, int(max(5, rng.gauss(75, 45))),
+                        CONNECT if rng.random() < .85 else UNANSWERED, True, rng.randint(200, 3000))
+                # 各自的外部往来：六成打给同一批亲友（共同被叫目标路径也是硬负例）
+                for _ in range(int(npr.poisson(5.0))):
+                    b = int(rng.choice(circle)) if rng.random() < .60 else int(rng.choice(OUT_POOL))
+                    t = _diurnal(rng, d)
+                    add(a, b, t, int(max(5, rng.gauss(90, 60))),
+                        CONNECT if rng.random() < .72 else UNANSWERED, True, rng.randint(200, 5000))
+
+    # ---- 正常业务增长：近 10 天通话量翻数倍，目标是熟人池（新目标比例不爆发）----
+    # 对 S2 的长时漂移是硬负例：基线 3 通/天 → 期末 25 通/天，但这是换工作，不是慢热诈骗。
+    growth_users = [new_user("growth", 0.0) for _ in range(n_growth)]
+    for u in growth_users:
+        pool = _pick(cust_pool[:400] + OUT_POOL[:300], rng.randint(60, 120))
+        lptr = (u * 3571) % 20000
+        for d in range(days):
+            ramp = max(0, d - (days - 10))
+            base = 3 if ramp == 0 and d < days - 10 else int(3 + ramp * 2.4)
+            for _ in range(base):
+                # 爬坡期四成打新客户（跑销售/接单），其余打熟人 —— 新目标比例升高到 0.3~0.5
+                if ramp > 0 and rng.random() < .45:
+                    b = lead_pool[lptr % len(lead_pool)]
+                    lptr += 1
+                else:
+                    b = pool[rng.randrange(len(pool))]
+                t = d * DAY + int(min(23.9, max(0.0, rng.gauss(19.2, 2.0))) * HOUR)
+                add(u, b, t, int(max(6, rng.gauss(50, 28))),
+                    CONNECT if rng.random() < .66 else UNANSWERED, True, rng.randint(200, 5000))
+
+    # ---- 良性突发：家长群 / 社区通知 / 红白事——截点前 1 小时打了一圈电话 ----
+    # 真实投诉里最主要的误报来源：短时行为与爆发型同形，但目标都是熟人、只此一次。
+    event_users = [new_user("event", 0.0) for _ in range(n_event)]
+    for i, u in enumerate(event_users):
+        cut = cuts[i % len(cuts)]
+        circle = _pick(OUT_POOL, 24)
+        for d in range(days):                                  # 日常就是普通用户
+            for _ in range(int(npr.poisson(6))):
+                add(u, int(rng.choice(circle)), _diurnal(rng, d),
+                    int(max(8, rng.gauss(70, 40))),
+                    CONNECT if rng.random() < .7 else UNANSWERED, True, rng.randint(200, 5000))
+        n_ev = rng.randint(26, 46)                             # 事件当天的一圈电话
+        dense = int(n_ev * .65)
+        for j in range(n_ev):
+            t = cut - (rng.randint(2, 14) if j < dense else rng.randint(15, 75)) * MIN
+            add(u, int(rng.choice(circle)), t, int(rng.uniform(8, 55)),
+                CONNECT if rng.random() < .8 else UNANSWERED, True, rng.randint(200, 3000))
+
     # ---- 关系观测 ----
     obs: List[Obs] = []
     oid = 0
@@ -221,6 +359,14 @@ def generate(seed: int = 7, days: int = 30, n_normal: int = 180,
 
     def keys_for(u: int) -> Dict[str, str]:
         k = users[u]
+        if k == "family":
+            fid = fam_of[u]
+            return {"D": f"dev-fam{fid}", "I": f"ip-fam{fid}", "B": f"bs-fam{fid}", "P": f"pay-u{u}"}
+        if k == "service":
+            office = u % 3                      # 同一坐席组的 3 人共用办公网络与基站
+            return {"D": f"dev-svc{u}", "I": f"ip-svc{office}", "B": f"bs-svc{office}", "P": f"pay-u{u}"}
+        if k == "growth":
+            return {"D": f"dev-u{u}", "I": f"ip-v{u % 40}", "B": f"bs-v{u % 40}", "P": f"pay-u{u}"}
         if k == "ring":
             r = next(r for r in rings if u in r)
             return {"D": f"dev-ring{r[0]}", "I": f"ip-ring{r[0]}", "B": f"bs-ring{r[0]}", "P": f"pay-ring{r[0]}"}
@@ -272,12 +418,12 @@ def generate(seed: int = 7, days: int = 30, n_normal: int = 180,
     # ---- 查询截点 ----
     queries: List[Query] = []
     qn = 0
-    cuts = [TEND - 7 * DAY, TEND - 2 * DAY, TEND]
+
     for u, kind in users.items():
         for c in cuts:
             if c <= DAY:
                 continue
-            label = int(kind != "normal" and c >= onset.get(u, T + 1))
+            label = int(kind in FRAUD_KINDS and c >= onset.get(u, T + 1))
             qc = 0.990 + rng.uniform(0, .009)
             if rng.random() < .04:
                 qc = 0.94

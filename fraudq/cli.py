@@ -9,6 +9,7 @@ import time
 from collections import Counter
 
 from .core import REL_KINDS, REL_NAME, STAT_NAMES
+from .data import FRAUD_KINDS
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -277,7 +278,7 @@ class App:
             minutes = (on + float(str(minutes)[3:]) * 60000 - base.cutoff) / 60000
         t = int(base.cutoff + minutes * 60000)
         kind = self.ds.archetype.get(user, "normal")
-        label = int(kind != "normal" and t >= on)
+        label = int(kind in FRAUD_KINDS and t >= on)
         q = Query(f"probe-{user}-{int(minutes)}", user, t, label, .99, .9, True)
         self._n = 0
         if t not in self.eng._peer:
@@ -446,6 +447,14 @@ def help_text() -> None:
     print()
 
 
+def _sig_ok(eng, ds) -> bool:
+    """工件自带训练数据集签名时，才校验是否与当前数据集一致（老工件无签名则兼容放行）。"""
+    sig = getattr(eng, "model_sig", None)
+    if not sig:
+        return False          # 老工件没有数据签名，无法确认匹配，按不匹配处理（一次性重训）
+    return sig.get("calls") == len(ds.calls) and sig.get("users") == len(ds.archetype)
+
+
 def ensure_assets(data_dir: str, model: str, auto: bool = True):
     from .data import Dataset, generate
     from .runtime import load
@@ -463,6 +472,13 @@ def ensure_assets(data_dir: str, model: str, auto: bool = True):
         print(c("  未找到模型，开始训练（约 2-3 分钟）…", "y"))
         fit(ds, epochs=8, out=model)
     eng, coord = load(model, ds)
+    # 模型与数据集错配（例如换了生成器却还用旧工件）必须重训，否则分数是静默错误的
+    if not _sig_ok(eng, ds):
+        if not auto:
+            raise SystemExit("模型与数据集不匹配，先运行 python -m fraudq --train")
+        print(c("  模型与数据集不匹配，重新训练（约 3-5 分钟）…", "y"))
+        fit(ds, epochs=8, out=model)
+        eng, coord = load(model, ds)
     return ds, eng, coord
 
 
@@ -471,6 +487,8 @@ def main(argv=None) -> None:
     ap.add_argument("--data", default="artifacts/data")
     ap.add_argument("--model", default="artifacts/model.pt")
     ap.add_argument("--train", action="store_true")
+    ap.add_argument("--no-regen", action="store_true",
+                    help="--train 时保留现有数据集（默认按生成器重新生成合成集）")
     ap.add_argument("--budget", type=float, default=200.0)
     ap.add_argument("--batch", type=int, default=0)
     ap.add_argument("--no-logo", action="store_true")
@@ -479,7 +497,9 @@ def main(argv=None) -> None:
     if a.train:
         from .data import Dataset, generate
         from .train import fit
-        if not os.path.exists(os.path.join(a.data, "calls.csv")):
+        if not a.no_regen:
+            # 默认按当前生成器重新生成合成集：否则改了生成器还会拿旧 CSV 训练
+            print(c(f"  重新生成合成集 -> {a.data} …", "y"))
             generate(seed=7).save(a.data)
         ds = Dataset.load(a.data)
         fit(ds, epochs=8, out=a.model)
