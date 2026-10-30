@@ -135,6 +135,7 @@ def fit(ds, epochs=5, out="artifacts/model.pt", verbose=True) -> dict:
     yy = torch.tensor([float(q.label) for q in tr_fit])
     for ep in range(epochs):
         eng._peer.clear()          # 每轮用当前权重重放对端记忆，避免训练/推理不一致
+        eng._W = None              # 同时丢弃 NumPy 权重缓存，否则重放用的仍是第一轮的权重
         perm = np.random.default_rng(ep).permutation(len(tr_fit))
         tot, n = 0.0, 0
         for i in perm:
@@ -165,6 +166,7 @@ def fit(ds, epochs=5, out="artifacts/model.pt", verbose=True) -> dict:
 
     # ---- 分支 Platt 校准 ----
     eng._peer.clear()              # 用收敛后的权重重放一次
+    eng._W = None                  # 同上，否则快照仍来自训练早期转换的那份权重
     for key, pl in (("T", m["platt_T"]), ("H", m["platt_H"])):
         xs, ys2 = [], []
         for q, i in sub:

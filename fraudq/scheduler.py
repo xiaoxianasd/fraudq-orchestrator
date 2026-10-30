@@ -75,6 +75,7 @@ class Engine:
         """新记录写入后：清画像/邻居缓存，丢弃受影响截点的记忆快照。"""
         self._prof.clear()
         self._h.clear()
+        self._W = None                     # TGN 权重的 NumPy 副本也要一并失效
         for t in [k for k in self._peer if k >= from_ts]:
             self._peer.pop(t, None)
 
