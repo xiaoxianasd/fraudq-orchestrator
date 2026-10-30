@@ -150,7 +150,12 @@ class App:
         s1, s2, han, fu, rp = r.get("S1", {}), r.get("S2", {}), r.get("HAN", {}), r.get("FUSE", {}), r.get("REPLAY", {})
         q = next((x for x in self.ds.queries if x.qid == tr.qid), None)
         print()
-        print(c(f"┌ 查询 {tr.qid}   用户 {tr.user}   截点 t+{tr.cutoff/86400000:.2f}d ", "B"))
+        try:
+            ci = self.by_user[tr.user].index(q) if q is not None else -1
+        except (KeyError, ValueError):
+            ci = -1
+        tag = f"   截点 #{ci}（共 {len(self.by_user.get(tr.user, []))} 个）" if ci >= 0 else ""
+        print(c(f"┌ 查询 {tr.qid}   用户 {tr.user}   截点 t+{tr.cutoff/86400000:.2f}d{tag} ", "B"))
         p_show = fu.get("p", r.get("SCREEN", {}).get("p0", 0.0))
         print(c("│", "d") + f" 初筛    p0={r.get('SCREEN',{}).get('p0',0):.3f}  综合证据   " + bar(p_show))
         if s1:
@@ -167,9 +172,12 @@ class App:
                 print(c("│", "d") + c(f"         窗口 W_s={s2['W_s']/60000:.0f}min W_l={s2['W_l']/86400000:.0f}d  "
                       f"K={s2['K']} D={s2['D']}  复现度R={s2['R']:.2f}", "d"))
         if han:
-            beta = han.get("beta") or [0] * 5
-            bs = "  ".join(f"{k}:{b:.2f}" for k, b in zip(REL_KINDS, beta) if b > 1e-3)
-            print(c("│", "d") + f" HAN     p^_H={han['p_cal']:.3f}  路径权重 {bs or '无非零路径'}")
+            if "p_cal" not in han:   # 预算不足被跳过时只有 skipped/reason，没有校准分
+                print(c("│", "d") + c(f" HAN     未执行：{han.get('reason') or '剩余时延预算不足'}", "d"))
+            else:
+                beta = han.get("beta") or [0] * 5
+                bs = "  ".join(f"{k}:{b:.2f}" for k, b in zip(REL_KINDS, beta) if b > 1e-3)
+                print(c("│", "d") + f" HAN     p^_H={han['p_cal']:.3f}  路径权重 {bs or '无非零路径'}")
         if fu:
             print(c("│", "d") + f" 融合    p={fu['p']:.3f}   " + bar(fu["p"]))
         if rp and rp.get("scenes"):
@@ -245,6 +253,8 @@ class App:
         qs = self.by_user.get(user)
         if not qs:
             print(c(f"  用户 {user} 没有查询截点（范围 0..{max(self.by_user)})", "r")); return
+        if cut is not None and not (-len(qs) <= cut < len(qs)):
+            print(c(f"  用户 {user} 只有 {len(qs)} 个截点（序号 0..{len(qs)-1}），已改用最后一个", "y"))
         q = qs[cut] if cut is not None and -len(qs) <= cut < len(qs) else qs[-1]
         self._n = 0
         tr = self.coord.run(q, budget or self.budget, replay_mode="defer",
@@ -362,9 +372,29 @@ class App:
         cmd, args = parts[0], parts[1:]
         if cmd in (":q", ":query"):
             if not args:
-                print(c("  用法 :q <用户号> [预算ms] [截点序号]", "y")); return True
-            self.query(int(args[0]), float(args[1]) if len(args) > 1 else None,
-                       int(args[2]) if len(args) > 2 else None)
+                print(c("  用法 :q <用户号> [预算ms] [截点序号]     "
+                        "例：:q 265 / :q 333 200 1 / :q 333 @1", "y")); return True
+            try:
+                user = int(args[0])
+            except ValueError:
+                print(c("  用户号必须是整数", "r")); return True
+            budget, cut, positional = None, None, []
+            try:
+                for a in args[1:]:
+                    if a.startswith("@"):
+                        cut = int(a[1:])
+                    else:
+                        positional.append(a)
+                if len(positional) >= 1:
+                    budget = float(positional[0])
+                if len(positional) >= 2:
+                    cut = int(positional[1])
+            except ValueError:
+                print(c(f"  参数无法解析：{args[1:]}（预算为毫秒数，截点用 @序号）", "r")); return True
+            if budget is not None and budget < 30:
+                print(c(f"  注意：预算 {budget:g}ms 过低，在线分支基本会被跳过；"
+                        "想指定截点请用 :q 用户 @截点", "y"))
+            self.query(user, budget, cut)
         elif cmd == ":why":
             self.why()
         elif cmd == ":replay":
