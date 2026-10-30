@@ -19,11 +19,32 @@ from .data import generate
 from .s1 import S1Agent, TGN
 from .s2 import S2Agent
 from .s3 import Fusion, HAN, Platt, S3HanAgent
-from .scheduler import Engine, Screener
+from .scheduler import Coordinator, Engine, Screener
 
 
 def ctx_of(engine, q) -> Context:
     return Context(q, engine.store, engine.prepare(q), Budget(1e9), Trace(q.qid, q.user, q.cutoff), engine)
+
+
+def fusion_inputs(engine, s1, s2, han_ag, fusion, q) -> Context:
+    """按**推理路径**跑一遍分支，产出融合层的 18 维输入。
+
+    必须与 Coordinator.run 完全一致，否则融合层学到的是另一个分布：
+      * 调度器总先写 RELQ（数据质量 + 路径可用标记），训练若漏写，
+        HAN 未执行时 v[6..14] 全为 0，而线上是 0.9x 量级；
+      * 调度器只在 relation_trigger 成立时才跑 HAN，训练若见路径就跑，
+        v[1]（HAN 对数几率）与 v[17]（HAN 执行掩码）会对不上（实测约 35% 的查询）。
+    """
+    from .s3 import FusionAgent
+    c = ctx_of(engine, q)
+    s1.run(c); s2.run(c)
+    quals, cands, avail = han_ag.available(c)
+    c.put("RELQ", quals=quals, avail=avail)              # 与调度器一致
+    trig, _ = Coordinator.relation_trigger(c)
+    if trig and any(avail.values()):                     # 与调度器一致
+        han_ag.run(c)
+    FusionAgent(fusion).run(c)
+    return c
 
 
 def split(queries, ratio=.7):
@@ -172,15 +193,7 @@ def fit(ds, epochs=5, out="artifacts/model.pt", verbose=True) -> dict:
     for p in m["han"].parameters(): p.requires_grad_(False)
 
     def branch_logits(q):
-        c = ctx_of(eng, q)
-        s1.run(c); s2.run(c)
-        quals, cands, avail = han_ag.available(c)
-        lg_h = _han_logit(han_ag, c, quals, cands, avail).detach() if any(avail.values()) else torch.tensor(0.0)
-        if any(avail.values()):
-            han_ag.run(c)
-        from .s3 import FusionAgent
-        FusionAgent(m["fusion"]).run(c)
-        return c
+        return fusion_inputs(eng, s1, s2, han_ag, m["fusion"], q)
 
     rows, ys = [], []
     for q in tr_fit:
