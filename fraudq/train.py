@@ -19,17 +19,48 @@ from .data import generate
 from .s1 import S1Agent, TGN
 from .s2 import S2Agent
 from .s3 import Fusion, HAN, Platt, S3HanAgent
-from .scheduler import Engine, Screener
+from .scheduler import Coordinator, Engine, Screener
 
 
 def ctx_of(engine, q) -> Context:
     return Context(q, engine.store, engine.prepare(q), Budget(1e9), Trace(q.qid, q.user, q.cutoff), engine)
 
 
+def fusion_inputs(engine, s1, s2, han_ag, fusion, q) -> Context:
+    """按**推理路径**跑一遍分支，产出融合层的 18 维输入。
+
+    必须与 Coordinator.run 完全一致，否则融合层学到的是另一个分布：
+      * 调度器总先写 RELQ（数据质量 + 路径可用标记），训练若漏写，
+        HAN 未执行时 v[6..14] 全为 0，而线上是 0.9x 量级；
+      * 调度器只在 relation_trigger 成立时才跑 HAN，训练若见路径就跑，
+        v[1]（HAN 对数几率）与 v[17]（HAN 执行掩码）会对不上（实测约 35% 的查询）。
+    """
+    from .s3 import FusionAgent
+    c = ctx_of(engine, q)
+    s1.run(c); s2.run(c)
+    quals, cands, avail = han_ag.available(c)
+    c.put("RELQ", quals=quals, avail=avail)              # 与调度器一致
+    trig, _ = Coordinator.relation_trigger(c)
+    if trig and any(avail.values()):                     # 与调度器一致
+        han_ag.run(c)
+    FusionAgent(fusion).run(c)
+    return c
+
+
 def split(queries, ratio=.7):
+    """按用户 7:3 划分，并对「是否出现过正例」分层。
+
+    纯随机划分在少数类用户只有十几个时会翻车：爆发型 10 个用户曾随机分成
+    3 训练 / 7 留出，模型只见过 3 个爆发用户，指标会被划分方式左右。
+    分层后正例用户与负例用户各自按比例切分，两边都留有各种形态。
+    """
     users = sorted({q.user for q in queries})
-    rng = np.random.default_rng(0); rng.shuffle(users)
-    tr = set(users[:int(len(users) * ratio)])
+    pos_u = {q.user for q in queries if q.label == 1}
+    rng = np.random.default_rng(0)
+    tr: set = set()
+    for group in (sorted(pos_u), sorted(set(users) - pos_u)):
+        rng.shuffle(group)
+        tr |= set(group[:int(round(len(group) * ratio))])
     return [q for q in queries if q.user in tr], [q for q in queries if q.user not in tr]
 
 
@@ -45,8 +76,9 @@ def fit(ds, epochs=5, out="artifacts/model.pt", verbose=True) -> dict:
     t0 = time.time()
     torch.manual_seed(0); np.random.seed(0)   # 固定随机初始化，保证结果可复现
     store = Store(ds.calls, ds.obs)
-    users = sorted({c.caller for c in ds.calls if c.caller < 200})
-    stats = store.fit_stats(users[:200], max(q.cutoff for q in ds.queries))
+    # 统计量只在本数据域的用户上估计（外部号码不参与），且用户数不再写死为 200
+    users = sorted(ds.archetype) if ds.archetype else sorted({c.caller for c in ds.calls})
+    stats = store.fit_stats(users, max(q.cutoff for q in ds.queries))
 
     m: Dict[str, object] = {"tgn": TGN().float(), "han": HAN().float(), "fusion": Fusion().float(),
                             "screener": Screener().float(), "platt_T": Platt(), "platt_H": Platt(),
@@ -54,14 +86,15 @@ def fit(ds, epochs=5, out="artifacts/model.pt", verbose=True) -> dict:
                             "s2_med": None, "s2_iqr": None, "version": "v1"}
     eng = Engine(store, m, peer_mode="global")
     tr, te = split(ds.queries)
-    if len(tr) > 220:
-        rng = np.random.default_rng(1)
-        pos = [q for q in tr if q.label == 1]
-        neg = [q for q in tr if q.label == 0]
-        keep = pos + [neg[i] for i in rng.choice(len(neg), min(len(neg), 220 - len(pos)), replace=False)]
-        tr_fit = keep
-    else:
-        tr_fit = tr
+    # 欠采样口径按说明书 3.5：正例全保留，**负例**上限 220。
+    # 若按"总数 220"截断，正例一多（如 136 条）就只剩 84 条负例，训练集变成
+    # 62% 正例，模型整体过判、精确率崩塌。
+    rng = np.random.default_rng(1)
+    pos = [q for q in tr if q.label == 1]
+    neg = [q for q in tr if q.label == 0]
+    if len(neg) > 220:
+        neg = [neg[i] for i in rng.choice(len(neg), 220, replace=False)]
+    tr_fit = pos + neg
     cutoffs = sorted({q.cutoff for q in ds.queries})
     if verbose:
         print(f"  [peers] {len(cutoffs)} 截点，按当前 TGN 权重惰性回放（不再预先生成随机权重快照）")
@@ -102,6 +135,7 @@ def fit(ds, epochs=5, out="artifacts/model.pt", verbose=True) -> dict:
     yy = torch.tensor([float(q.label) for q in tr_fit])
     for ep in range(epochs):
         eng._peer.clear()          # 每轮用当前权重重放对端记忆，避免训练/推理不一致
+        eng._W = None              # 同时丢弃 NumPy 权重缓存，否则重放用的仍是第一轮的权重
         perm = np.random.default_rng(ep).permutation(len(tr_fit))
         tot, n = 0.0, 0
         for i in perm:
@@ -132,6 +166,7 @@ def fit(ds, epochs=5, out="artifacts/model.pt", verbose=True) -> dict:
 
     # ---- 分支 Platt 校准 ----
     eng._peer.clear()              # 用收敛后的权重重放一次
+    eng._W = None                  # 同上，否则快照仍来自训练早期转换的那份权重
     for key, pl in (("T", m["platt_T"]), ("H", m["platt_H"])):
         xs, ys2 = [], []
         for q, i in sub:
@@ -160,15 +195,7 @@ def fit(ds, epochs=5, out="artifacts/model.pt", verbose=True) -> dict:
     for p in m["han"].parameters(): p.requires_grad_(False)
 
     def branch_logits(q):
-        c = ctx_of(eng, q)
-        s1.run(c); s2.run(c)
-        quals, cands, avail = han_ag.available(c)
-        lg_h = _han_logit(han_ag, c, quals, cands, avail).detach() if any(avail.values()) else torch.tensor(0.0)
-        if any(avail.values()):
-            han_ag.run(c)
-        from .s3 import FusionAgent
-        FusionAgent(m["fusion"]).run(c)
-        return c
+        return fusion_inputs(eng, s1, s2, han_ag, m["fusion"], q)
 
     rows, ys = [], []
     for q in tr_fit:
@@ -195,7 +222,9 @@ def fit(ds, epochs=5, out="artifacts/model.pt", verbose=True) -> dict:
                                           "med": m["s2_med"], "iqr": m["s2_iqr"],
                                           "ok": m.get("s2_ok", True)},
 
-                "version": "v1"}, out)
+                "version": "v1",
+                "data_sig": {"users": len(ds.archetype), "calls": len(ds.calls),
+                             "queries": len(ds.queries)}}, out)
     if verbose:
         print(f"  [SAVE] {out}  {os.path.getsize(out)/1e6:.1f} MB  {time.time()-t0:.0f}s")
     return {"engine": eng, "models": m, "test": te, "store": store}

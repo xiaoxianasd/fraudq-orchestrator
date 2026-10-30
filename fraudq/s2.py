@@ -55,6 +55,16 @@ def _kmeans(X: np.ndarray, k: int, iters: int = 25, seed: int = 0) -> np.ndarray
     return C
 
 
+def bucket_span(t: int, K: int, T_B: int, a: int, b: int) -> tuple[int, int]:
+    """第 a..b 个桶覆盖的时间区间 (start, end)，单位毫秒。
+
+    桶 k（0 基）覆盖 [t-(K-k)·T_B, t-(K-k-1)·T_B]。返回值恒满足 start <= end、
+    end-start = (b-a+1)·T_B —— 端点一旦写反，时间一致性会被 max(0, ·) 压成 0，
+    「双尺度互证」就永远不可能触发。
+    """
+    return t - (K - a) * T_B, t - (K - b - 1) * T_B
+
+
 def _cos(p: np.ndarray, M: np.ndarray) -> np.ndarray:
     p = p / (np.linalg.norm(p) + 1e-9)
     M = M / (np.linalg.norm(M, axis=1, keepdims=True) + 1e-9)
@@ -306,7 +316,7 @@ class S2Agent:
                     cur = [k, k]
             if cur[1] - cur[0] > best[1] - best[0]:
                 best = list(cur)
-            spans.append((t - (K - best[1] - 1) * T_B, t - (K - best[0]) * T_B))
+            spans.append(bucket_span(t, K, T_B, best[0], best[1]))
         if spans:
             t_s_start = min(x[0] for x in spans)
             t_s_end = max(x[1] for x in spans)
@@ -376,9 +386,11 @@ class S2Agent:
         gap = max(0.0, (t_s_start - t_l_end) / 1000.0)
         c_temp = float(np.sqrt(min(1, rs_) * min(1, rl_)) * np.exp(-gap / (TAU_ALIGN / 1000)))
         if B_s >= TH_BS and B_l >= TH_BL and c_temp >= C0:
-            lam, flag = 1.4, "已互证"
+            lam, flag = 1.4, "已互证"          # 双尺度互证：提权
+        elif B_s >= TH_BS and B_l >= TH_BL:
+            lam, flag = .65, "未互证"          # 两尺度都越阈但时间对不上：降权
         elif B_s >= TH_BS or B_l >= TH_BL:
-            lam, flag = .65, "待核验"
+            lam, flag = .65, "待核验"          # 单一窗口异常：降权
         else:
             lam, flag = 0.0, "无核验证据"
         e_ts = W_TS * lam * (ETA0 + (1 - ETA0) * c_temp) * (ALPHA * B_s + (1 - ALPHA) * B_l) * (1 + GAMMA * R)
