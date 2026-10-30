@@ -27,9 +27,19 @@ def ctx_of(engine, q) -> Context:
 
 
 def split(queries, ratio=.7):
+    """按用户 7:3 划分，并对「是否出现过正例」分层。
+
+    纯随机划分在少数类用户只有十几个时会翻车：爆发型 10 个用户曾随机分成
+    3 训练 / 7 留出，模型只见过 3 个爆发用户，指标会被划分方式左右。
+    分层后正例用户与负例用户各自按比例切分，两边都留有各种形态。
+    """
     users = sorted({q.user for q in queries})
-    rng = np.random.default_rng(0); rng.shuffle(users)
-    tr = set(users[:int(len(users) * ratio)])
+    pos_u = {q.user for q in queries if q.label == 1}
+    rng = np.random.default_rng(0)
+    tr: set = set()
+    for group in (sorted(pos_u), sorted(set(users) - pos_u)):
+        rng.shuffle(group)
+        tr |= set(group[:int(round(len(group) * ratio))])
     return [q for q in queries if q.user in tr], [q for q in queries if q.user not in tr]
 
 
@@ -55,14 +65,15 @@ def fit(ds, epochs=5, out="artifacts/model.pt", verbose=True) -> dict:
                             "s2_med": None, "s2_iqr": None, "version": "v1"}
     eng = Engine(store, m, peer_mode="global")
     tr, te = split(ds.queries)
-    if len(tr) > 220:
-        rng = np.random.default_rng(1)
-        pos = [q for q in tr if q.label == 1]
-        neg = [q for q in tr if q.label == 0]
-        keep = pos + [neg[i] for i in rng.choice(len(neg), min(len(neg), 220 - len(pos)), replace=False)]
-        tr_fit = keep
-    else:
-        tr_fit = tr
+    # 欠采样口径按说明书 3.5：正例全保留，**负例**上限 220。
+    # 若按"总数 220"截断，正例一多（如 136 条）就只剩 84 条负例，训练集变成
+    # 62% 正例，模型整体过判、精确率崩塌。
+    rng = np.random.default_rng(1)
+    pos = [q for q in tr if q.label == 1]
+    neg = [q for q in tr if q.label == 0]
+    if len(neg) > 220:
+        neg = [neg[i] for i in rng.choice(len(neg), 220, replace=False)]
+    tr_fit = pos + neg
     cutoffs = sorted({q.cutoff for q in ds.queries})
     if verbose:
         print(f"  [peers] {len(cutoffs)} 截点，按当前 TGN 权重惰性回放（不再预先生成随机权重快照）")

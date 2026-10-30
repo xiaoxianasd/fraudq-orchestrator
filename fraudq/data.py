@@ -23,7 +23,7 @@ CUST_BASE = 700000                             # 合法高频业务（客服/催
 LEAD_BASE = 600000                             # 外呼线索池：只打一次的新名单，占比高但不重复
 COVER_P = .88          # 每条通话为两端各生成四类关联观测的概率（保证窗口覆盖率 >0.80）
 OUT_POOL = [200000 + i for i in range(1200)]   # 有限外部号码池，避免节点数爆炸
-FRAUD_KINDS = ("burst", "slow", "ring")        # 只有这三类是正例；service/family/growth 是难负例
+FRAUD_KINDS = ("burst", "slow", "ring", "surg")   # 正例；service/family/growth/event 是难负例
 
 
 @dataclass
@@ -106,10 +106,10 @@ def _diurnal(rng: random.Random, day: int) -> int:
     return day * DAY + int(h * HOUR)
 
 
-def generate(seed: int = 7, days: int = 30, n_normal: int = 180,
-             n_burst: int = 10, n_slow: int = 10, n_ring: int = 2, ring_size: int = 3,
-             n_service: int = 8, n_family: int = 6, family_size: int = 4,
-             n_growth: int = 8, n_event: int = 10) -> Dataset:
+def generate(seed: int = 7, days: int = 30, n_normal: int = 240,
+             n_burst: int = 16, n_slow: int = 16, n_ring: int = 3, ring_size: int = 3,
+             n_service: int = 10, n_family: int = 8, family_size: int = 4,
+             n_growth: int = 10, n_event: int = 12, n_surg: int = 10) -> Dataset:
     """合成 CDR。
 
     前 6 个参数与旧版一致：把 n_service / n_family / n_growth 置 0 即可逐字节复现旧数据集。
@@ -118,6 +118,9 @@ def generate(seed: int = 7, days: int = 30, n_normal: int = 180,
       family   一家人共享同一部手机、家庭网络与小区基站
       growth   正常业务增长：近 10 天通话量翻数倍（换工作 / 跑销售），目标是熟人池
       event    良性突发：家长群 / 社区通知 / 红白事，截点前 1 小时打了一圈熟人电话
+
+    正例里另加 surg（慢热转爆发）：9 天爬坡 + 末段集中拨打，用来真正触发
+    「双尺度互证」——只有它同时具备短时突发与长时渐变。
     """
     rng = random.Random(seed)
     npr = np.random.default_rng(seed)
@@ -345,6 +348,29 @@ def generate(seed: int = 7, days: int = 30, n_normal: int = 180,
             add(u, int(rng.choice(circle)), t, int(rng.uniform(8, 55)),
                 CONNECT if rng.random() < .8 else UNANSWERED, True, rng.randint(200, 3000))
 
+    # ---- 慢热转爆发（正例）：9 天爬坡 + 末段集中拨打 ----
+    # 唯一同时具备「长时渐变」与「短时突发」的诈骗形态，也是说明书 2.4 双尺度互证
+    # 与 claim 4/5 要处理的对象；只用独立随机源 rng3，保证既有用户的画序逐条不变。
+    rng3 = random.Random(seed * 7919 + 13)
+    for _ in range(n_surg):
+        u = new_user("surg", .10, TEND - 9 * DAY)
+        close = [int(x) for x in npr.choice([k for k in users if k != u], size=6, replace=False)]
+        for d in range(days - 9):                       # 前 21 天：正常用户
+            for _ in range(int(npr.poisson(6))):
+                b = int(rng3.choice(close)) if rng3.random() < .6 else int(rng3.choice(OUT_POOL))
+                add(u, b, _diurnal(rng3, d), int(max(8, rng3.gauss(80, 45))),
+                    CONNECT if rng3.random() < .70 else UNANSWERED, True, rng3.randint(200, 5000))
+        for d in range(days - 9, days):                 # 后 9 天：逐日爬坡
+            k = 6 + (d - (days - 9)) * 3
+            for _ in range(k):
+                t = d * DAY + int(min(23.9, max(0.0, rng3.gauss(19.5, 2.0))) * HOUR)
+                add(u, VICTIM_BASE + int(rng3.uniform(0, 400)), t, int(rng3.uniform(8, 50)),
+                    CONNECT if rng3.random() < .65 else UNANSWERED, True, rng3.randint(200, 5000))
+        for _ in range(int(rng3.randint(45, 75))):      # 末段 55 分钟：集中拨打
+            t = TEND - rng3.randint(1, 55) * MIN
+            add(u, VICTIM_BASE + int(rng3.uniform(0, 500)), t, int(rng3.uniform(3, 20)),
+                CONNECT if rng3.random() < .80 else UNANSWERED, True, rng3.randint(100, 2500))
+
     # ---- 关系观测 ----
     obs: List[Obs] = []
     oid = 0
@@ -370,7 +396,7 @@ def generate(seed: int = 7, days: int = 30, n_normal: int = 180,
         if k == "ring":
             r = next(r for r in rings if u in r)
             return {"D": f"dev-ring{r[0]}", "I": f"ip-ring{r[0]}", "B": f"bs-ring{r[0]}", "P": f"pay-ring{r[0]}"}
-        if k == "burst":
+        if k in ("burst", "surg"):
             return {"D": f"dev-u{u}", "I": f"ip-u{u}", "B": f"bs-u{u}", "P": f"pay-u{u}"}
         venue = u % 40 if k == "normal" else u
         return {"D": f"dev-u{u}", "I": f"ip-v{venue}", "B": f"bs-v{venue}", "P": f"pay-u{u}"}
