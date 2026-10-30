@@ -27,6 +27,13 @@ python -m fraudq --train      # 重新训练
 若删掉模型、或模型与数据集对不上（工件内含 `data_sig` 校验），会自动重训。
 注意：对端快照不得单独删除——去掉后分数会变（原因见「已知限制」第 7 条）。
 
+回归测试（两个脚本，直接运行，打印「全部通过」即通过）：
+
+```bash
+python tests/test_s2_interval.py    # S2 短时异常区间端点几何（历史 bug：写成 (end, start) 导致互证永不触发）
+python tests/test_fusion_parity.py  # 融合层训练/推理口径一致性（执行掩码 + RELQ）
+```
+
 进入终端后：
 
 ```text
